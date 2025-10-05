@@ -1,360 +1,450 @@
-# mini_chain_sim.py
-# A minimal PoW blockchain network simulator with balances, hashrate, blocks-in-flight, and latency.
-# Uses Gaussian (normal) for latency/jitter and Bernoulli for per-step events.
-
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
-import numpy as np
+from __future__ import annotations
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Tuple, Optional, Callable, Any
 import heapq
 import itertools
+import numpy as np
+import math
 import time
 
-# -----------------------------
-# Data models
-# -----------------------------
+# =========================
+# Config
+
 @dataclass
-class Tx:
+class SimConfig:
+    seed: int = 123
+    dt_ms: int = 100                           # simulation tick
+    sim_time_ms: int = 2 * 60 * 1000           # total runtime (example: 2 minutes)
+    # Nodes / accounts
+    n_nodes: int = 8
+    init_balance: float = 100.0
+    hashrate_base_hs: float = 1e9              # 1 GH/s baseline
+    hashrate_jitter_sigma: float = 0.4         # log-normal jitter (exp(N(0,sigma)))
+    # Latency (Gaussian, clipped)
+    node_latency_mean_mu: float = 60.0         # ms, per-node mean drawn from N(mu, sigma)
+    node_latency_mean_sigma: float = 20.0
+    node_latency_std_scale: float = 0.25       # std ~= scale * mean (>= min below)
+    node_latency_std_min: float = 5.0
+    # Edges / link layer
+    default_bandwidth_kbps: float = 5000.0     # serialize cost = size_kB / (bw_kBps)
+    link_drop_prob: float = 0.01               # Bernoulli
+    # Processing (Gaussian, clipped)
+    node_proc_mean_ms: float = 5.0
+    node_proc_std_ms: float = 2.0
+    # Transaction generation (Bernoulli per-tick)
+    tx_create_p: float = 0.10
+    tx_amount_mean: float = 1.0
+    tx_fee_mean: float = 0.01
+    tx_size_kB_mean: float = 0.5
+    # Blocks / PoW (optional for routing, but included to track "blocks in flight")
+    target_block_time_ms: int = 25_000
+    block_size_txs: int = 800
+    coinbase_reward: float = 6.25
+
+# =========================
+# Entities
+# =========================
+
+@dataclass
+class Transaction:
     tx_id: int
     src: int
     dst: int
-    amount: float
+    value: float
     fee: float
+    size_kB: float
+    created_ms: int
+    deadline_ms: Optional[int] = None          # for QoS experiments later
+    path_hint: Optional[List[int]] = None      # optional fixed path (for baselines)
 
 @dataclass
 class Block:
     block_id: int
     miner: int
     parent_id: Optional[int]
-    timestamp_ms: int  # when mined (global sim time)
-    txs: List[Tx] = field(default_factory=list)
+    timestamp_ms: int
+    txs: List[Transaction] = field(default_factory=list)
 
-# -----------------------------
-# Node (miner/full node)
-# -----------------------------
+@dataclass
 class Node:
-    def __init__(self, node_id: int, init_balance: float, hashrate_hs: float,
-                 latency_mean_ms: float, latency_std_ms: float):
-        self.id = node_id
-        self.balance = init_balance
-        self.hashrate = hashrate_hs
-        self.latency_mean = latency_mean_ms
-        self.latency_std = latency_std_ms
-        self.neighbors: List[int] = []  # full mesh by default; can customize
-        self.mempool: Dict[int, Tx] = {}
-        self.seen_blocks: set[int] = set()
-        # simple chain view
-        self.blocks: Dict[int, Block] = {}
-        self.heights: Dict[int, int] = {}  # block_id -> height
-        self.head_id: Optional[int] = None
+    node_id: int
+    balance: float
+    hashrate_hs: float
+    latency_mean_ms: float
+    latency_std_ms: float
+    proc_mean_ms: float
+    proc_std_ms: float
+    neighbors: List[int] = field(default_factory=list)
+    # Mempool & chain view (simplified)
+    mempool: Dict[int, Transaction] = field(default_factory=dict)
+    seen_blocks: set[int] = field(default_factory=set)
+    blocks: Dict[int, Block] = field(default_factory=dict)
+    heights: Dict[int, int] = field(default_factory=dict)
+    head_id: Optional[int] = None
 
-    def add_neighbor(self, nid: int):
-        if nid != self.id and nid not in self.neighbors:
-            self.neighbors.append(nid)
+@dataclass
+class Edge:
+    u: int
+    v: int
+    bandwidth_kBps: float
+    # Additional per-edge attributes can go here (policy score, trust, etc.)
 
-    def chain_height(self) -> int:
-        if self.head_id is None:
-            return -1
-        return self.heights.get(self.head_id, -1)
+@dataclass
+class PathIntent:
+    """A routing request: move a transaction from src to dst minimizing some cost."""
+    tx_id: int
+    src: int
+    dst: int
+    created_ms: int
 
-# -----------------------------
-# Event queue
-# -----------------------------
-# events are tuples: (deliver_time_ms, seq, event_type, payload)
-# event_type in {"deliver_block", "deliver_tx"}
+# =========================
+# Events & Queue
+# =========================
+
+@dataclass(order=True)
+class Event:
+    deliver_ms: int
+    seq: int
+    kind: str = field(compare=False)
+    payload: Dict[str, Any] = field(compare=False)
+
 class EventQueue:
     def __init__(self):
-        self._pq: List[Tuple[int, int, str, dict]] = []
+        self._pq: List[Event] = []
         self._seq = itertools.count()
 
-    def push(self, when_ms: int, event_type: str, payload: dict):
-        heapq.heappush(self._pq, (when_ms, next(self._seq), event_type, payload))
+    def push(self, when_ms: int, kind: str, payload: Dict[str, Any]):
+        heapq.heappush(self._pq, Event(when_ms, next(self._seq), kind, payload))
 
-    def pop_ready(self, now_ms: int) -> List[Tuple[str, dict]]:
+    def pop_ready(self, now_ms: int) -> List[Event]:
         out = []
-        while self._pq and self._pq[0][0] <= now_ms:
-            _, _, et, pl = heapq.heappop(self._pq)
-            out.append((et, pl))
+        while self._pq and self._pq[0].deliver_ms <= now_ms:
+            out.append(heapq.heappop(self._pq))
         return out
 
     def count_inflight_blocks(self) -> int:
-        # Count pending deliver_block events
-        return sum(1 for _, _, et, _ in self._pq if et == "deliver_block")
+        return sum(1 for ev in self._pq if ev.kind == "deliver_block")
 
-    def avg_scheduled_latency_ms(self) -> float:
-        # Not exact per-block latency, but good for a summary: only for deliver_block events
-        latencies = []
-        now = int(time.time() * 1000)  # not the sim time; just for fallback
-        for when_ms, _, et, pl in self._pq:
-            if et == "deliver_block" and "scheduled_at" in pl:
-                latencies.append(max(0, when_ms - pl["scheduled_at"]))
-        return float(np.mean(latencies)) if latencies else 0.0
+    def count_inflight_txs(self) -> int:
+        return sum(1 for ev in self._pq if ev.kind == "deliver_tx")
 
-# -----------------------------
-# Network simulator
-# -----------------------------
-class NetworkSim:
-    def __init__(self,
-                 n_nodes: int = 5,
-                 target_block_time_ms: int = 30_000,
-                 dt_ms: int = 100,                 # simulation tick
-                 sim_time_ms: int = 120_000,       # total run time
-                 tx_bernoulli_p: float = 0.1,      # per-tick chance to create a tx
-                 tx_amount_mean: float = 1.0,
-                 tx_fee_mean: float = 0.01,
-                 block_size_txs: int = 500,
-                 seed: int = 42):
+# =========================
+# Random sources (Gauss/Bernoulli)
+# =========================
+
+class Rand:
+    def __init__(self, seed: int):
         self.rng = np.random.default_rng(seed)
-        self.dt_ms = dt_ms
+
+    def gauss_clip(self, mu: float, sigma: float, min_val: float = 0.0) -> float:
+        x = self.rng.normal(mu, sigma)
+        return float(max(min_val, x))
+
+    def bernoulli(self, p: float) -> bool:
+        return bool(self.rng.binomial(1, p))
+
+    def lognormal_like(self, sigma: float) -> float:
+        # exp(N(0,sigma)) ~ log-normal with median=1
+        return float(np.exp(self.rng.normal(0.0, sigma)))
+
+    def choice(self, seq: List[int], p: Optional[np.ndarray] = None) -> int:
+        return int(self.rng.choice(seq, p=p))
+
+# =========================
+# State & Metrics
+# =========================
+
+@dataclass
+class NetworkState:
+    """Snapshot suitable for RL observation later (kept simple for now)."""
+    time_ms: int
+    balances: Dict[int, float]
+    hashrates: Dict[int, float]
+    latency_means: Dict[int, float]
+    mempool_sizes: Dict[int, int]
+    inflight_blocks: int
+    inflight_txs: int
+
+@dataclass
+class Metrics:
+    blocks_mined: int = 0
+    blocks_stale: int = 0
+    tx_injected: int = 0
+    tx_delivered: int = 0
+    tx_dropped: int = 0
+    tx_avg_end_to_end_ms: float = 0.0   # EWMA
+    orphan_rate: float = 0.0            # derived: stale / mined
+
+# =========================
+# Router interface (NO optimization now)
+# =========================
+
+class BaseRouter:
+    """Strategy that decides which neighbor to forward a TX to.
+    DO NOT implement optimization here; this is an interface and placeholder."""
+    def route_next_hop(self, node_id: int, tx: Transaction, neighbors: List[int], state: "Sim") -> Optional[int]:
+        raise NotImplementedError
+
+class PlaceholderRouter(BaseRouter):
+    """A trivial router you can replace later.
+    - If the destination is an immediate neighbor, use it.
+    - Otherwise, pick a neighbor uniformly at random.
+    """
+    def route_next_hop(self, node_id: int, tx: Transaction, neighbors: List[int], state: "Sim") -> Optional[int]:
+        if tx.dst in neighbors:
+            return tx.dst
+        if not neighbors:
+            return None
+        return state.rand.choice(neighbors)
+
+# =========================
+# Simulator
+# =========================
+
+class Sim:
+    def __init__(self, cfg: SimConfig):
+        self.cfg = cfg
+        self.rand = Rand(cfg.seed)
         self.time_ms = 0
-        self.end_time_ms = sim_time_ms
-        self.target_block_time_ms = target_block_time_ms
-        self.block_size_txs = block_size_txs
-        self.tx_p = tx_bernoulli_p
-        self.tx_amount_mean = tx_amount_mean
-        self.tx_fee_mean = tx_fee_mean
+        self.q = EventQueue()
+        self.metrics = Metrics()
+        self.router: BaseRouter = PlaceholderRouter()  # swap later
 
-        # Build nodes with varied hashrate/latency using Gaussian for realism
+        # Build nodes with per-node latency/processing drawn from Gaussians
         self.nodes: Dict[int, Node] = {}
-        base_hash = 1e9  # 1 GH/s baseline
-        base_bal = 100.0
-        for i in range(n_nodes):
-            # Hashrate: lognormal-ish by exponentiating a normal for diversity
-            hr = base_hash * float(np.exp(self.rng.normal(0.0, 0.4)))
-            # Latency: normal clipped at >= 1 ms
-            lat_mean = max(1.0, float(self.rng.normal(60.0, 20.0)))
-            lat_std = max(5.0, lat_mean * 0.25)
-            self.nodes[i] = Node(i, base_bal, hr, lat_mean, lat_std)
+        for i in range(cfg.n_nodes):
+            lat_mean = self.rand.gauss_clip(cfg.node_latency_mean_mu, cfg.node_latency_mean_sigma, min_val=1.0)
+            lat_std = max(cfg.node_latency_std_min, cfg.node_latency_std_scale * lat_mean)
+            proc_mean = cfg.node_proc_mean_ms
+            proc_std = max(0.1, cfg.node_proc_std_ms)
+            hashrate = cfg.hashrate_base_hs * self.rand.lognormal_like(cfg.hashrate_jitter_sigma)
+            self.nodes[i] = Node(
+                node_id=i,
+                balance=cfg.init_balance,
+                hashrate_hs=hashrate,
+                latency_mean_ms=lat_mean,
+                latency_std_ms=lat_std,
+                proc_mean_ms=proc_mean,
+                proc_std_ms=proc_std,
+            )
 
-        # Fully connect the graph
-        for i in range(n_nodes):
-            for j in range(n_nodes):
-                if i != j:
-                    self.nodes[i].add_neighbor(j)
+        # Fully connect (undirected edges)
+        self.edges: Dict[Tuple[int, int], Edge] = {}
+        for i in self.nodes:
+            for j in self.nodes:
+                if i == j: continue
+                self.nodes[i].neighbors.append(j)
+                self.edges[(i, j)] = Edge(u=i, v=j, bandwidth_kBps=cfg.default_bandwidth_kbps)
 
-        # Genesis
+        # Genesis block on each node
         self.block_seq = itertools.count(start=1)
         self.tx_seq = itertools.count(start=1)
-        self.global_blocks: Dict[int, Block] = {}
-        self.genesis = Block(block_id=0, miner=-1, parent_id=None, timestamp_ms=0, txs=[])
+        genesis = Block(block_id=0, miner=-1, parent_id=None, timestamp_ms=0)
         for n in self.nodes.values():
-            n.blocks[0] = self.genesis
+            n.blocks[0] = genesis
             n.heights[0] = 0
             n.head_id = 0
             n.seen_blocks.add(0)
 
-        self.q = EventQueue()
-        self._last_stats_print = -999999
+    # ---------- Distributions ----------
 
-        # mining difficulty proxy: we use Bernoulli per tick scaled to target time
-        self._difficulty_scale = 1.0  # conceptual placeholder
+    def sample_link_latency_ms(self, u: int, v: int) -> int:
+        a, b = self.nodes[u], self.nodes[v]
+        mu = 0.5 * (a.latency_mean_ms + b.latency_mean_ms)
+        sigma = 0.5 * (a.latency_std_ms + b.latency_std_ms)
+        return int(self.rand.gauss_clip(mu, sigma, min_val=1.0))
 
-    # -------------------------
-    # Sampling helpers
-    # -------------------------
-    def sample_latency(self, node_from: Node, node_to: Node) -> int:
-        # Gaussian latency in ms, clipped
-        mu = 0.5 * (node_from.latency_mean + node_to.latency_mean)
-        sigma = 0.5 * (node_from.latency_std + node_to.latency_std)
-        sample = self.rng.normal(mu, sigma)
-        return int(max(1.0, sample))
+    def sample_proc_ms(self, node_id: int) -> int:
+        n = self.nodes[node_id]
+        return int(self.rand.gauss_clip(n.proc_mean_ms, n.proc_std_ms, min_val=0.0))
 
-    def maybe_create_random_tx(self):
-        # Bernoulli: per tick, maybe create 1 transaction (keeps it simple)
-        if self.rng.binomial(1, self.tx_p) == 0:
-            return None
-        # pick src != dst; bias src by balance (richer accounts more likely to spend)
-        node_ids = list(self.nodes.keys())
-        balances = np.array([max(0.0, self.nodes[i].balance) for i in node_ids], dtype=float)
-        weights = balances + 1.0  # avoid zero-probability
-        src = int(self.rng.choice(node_ids, p=weights / weights.sum()))
-        dst = int(self.rng.choice([i for i in node_ids if i != src]))
-        amount = max(0.001, float(self.rng.normal(self.tx_amount_mean, 0.25 * self.tx_amount_mean)))
-        fee = max(0.0001, float(self.rng.normal(self.tx_fee_mean, 0.2 * self.tx_fee_mean)))
-        # Only create if src can afford (soft check; final check at inclusion time)
-        if self.nodes[src].balance < amount + fee:
-            return None
-        tx = Tx(tx_id=next(self.tx_seq), src=src, dst=dst, amount=amount, fee=fee)
-        return tx
+    def bern_drop(self) -> bool:
+        return self.rand.bernoulli(self.cfg.link_drop_prob)
 
-    def total_hashrate(self) -> float:
-        return sum(n.hashrate for n in self.nodes.values())
+    # ---------- Transactions ----------
 
-    # -------------------------
-    # Propagation
-    # -------------------------
-    def broadcast_block(self, origin_id: int, block: Block):
-        for nid in self.nodes[origin_id].neighbors:
-            delay = self.sample_latency(self.nodes[origin_id], self.nodes[nid])
-            payload = dict(
-                block=block,
-                to=nid,
-                scheduled_at=self.time_ms
-            )
-            self.q.push(self.time_ms + delay, "deliver_block", payload)
-
-    def broadcast_tx(self, origin_id: int, tx: Tx):
-        for nid in self.nodes[origin_id].neighbors:
-            delay = self.sample_latency(self.nodes[origin_id], self.nodes[nid])
-            self.q.push(self.time_ms + delay, "deliver_tx", dict(tx=tx, to=nid))
-
-    def on_block_arrival(self, node: Node, block: Block):
-        if block.block_id in node.seen_blocks:
+    def maybe_inject_tx(self):
+        if not self.rand.bernoulli(self.cfg.tx_create_p):
             return
-        # accept parent?
-        parent_ok = (block.parent_id in node.blocks)
-        if not parent_ok:
-            # naive handling: we'll still store it but not advance head if parent missing
-            node.blocks[block.block_id] = block
-            node.heights[block.block_id] = node.heights.get(block.parent_id, -1) + 1
-            node.seen_blocks.add(block.block_id)
+        ids = list(self.nodes.keys())
+        # weight source by balance (richer emits more)
+        bal = np.array([max(0.0, self.nodes[i].balance) for i in ids], dtype=float)
+        p = (bal + 1.0) / (bal.sum() + len(ids))
+        src = self.rand.choice(ids, p=p)
+        dst = self.rand.choice([i for i in ids if i != src])
+        value = max(0.0001, float(self.rand.gauss_clip(self.cfg.tx_amount_mean, 0.25 * self.cfg.tx_amount_mean, 0.0001)))
+        fee   = max(0.00001, float(self.rand.gauss_clip(self.cfg.tx_fee_mean,   0.20 * self.cfg.tx_fee_mean,   0.00001)))
+        size_kB = max(0.01, float(self.rand.gauss_clip(self.cfg.tx_size_kB_mean, 0.15 * self.cfg.tx_size_kB_mean, 0.01)))
+        tx = Transaction(tx_id=next(self.tx_seq), src=src, dst=dst, value=value, fee=fee, size_kB=size_kB, created_ms=self.time_ms)
+        self.metrics.tx_injected += 1
+        # Add to src mempool and trigger local forwarding
+        self.nodes[src].mempool[tx.tx_id] = tx
+        self.schedule_tx_forward(src, tx)
+
+    def schedule_tx_forward(self, node_id: int, tx: Transaction):
+        """Ask router for the next hop and schedule delivery with latency + serialization + processing."""
+        node = self.nodes[node_id]
+        hop = self.router.route_next_hop(node_id, tx, node.neighbors, self)
+        if hop is None:
+            return  # nowhere to go
+        # link drop?
+        if self.bern_drop():
+            self.metrics.tx_dropped += 1
             return
+        # delay = serialization + link latency + processing at receiver
+        edge = self.edges[(node_id, hop)]
+        ser_ms = int(1000.0 * tx.size_kB / max(1e-6, edge.bandwidth_kBps))
+        prop_ms = self.sample_link_latency_ms(node_id, hop)
+        proc_ms = self.sample_proc_ms(hop)
+        total = ser_ms + prop_ms + proc_ms
+        self.q.push(self.time_ms + total, "deliver_tx", dict(tx=tx, to=hop))
 
-        # compute new height and potential reorg
-        h_parent = node.heights[block.parent_id]
-        h_new = h_parent + 1
-        node.blocks[block.block_id] = block
-        node.heights[block.block_id] = h_new
-        node.seen_blocks.add(block.block_id)
-
-        if node.head_id is None or h_new > node.heights.get(node.head_id, -1):
-            node.head_id = block.block_id
-            # apply coinbase/fees immediately for simplicity ONLY on first acceptance
-            # (A fuller model would do UTXO + reorg-aware balance changes.)
-            self.apply_block_rewards(node, block)
-
-        # remove included txs from mempool
-        for tx in block.txs:
-            node.mempool.pop(tx.tx_id, None)
-
-    def on_tx_arrival(self, node: Node, tx: Tx):
+    def on_tx_arrival(self, node_id: int, tx: Transaction):
+        node = self.nodes[node_id]
         if tx.tx_id in node.mempool:
+            # already seen here; ignore
             return
         node.mempool[tx.tx_id] = tx
+        if node_id == tx.dst:
+            # "delivery" (account-model apply, simplified)
+            self.nodes[tx.src].balance -= (tx.value + tx.fee)
+            self.nodes[tx.dst].balance += tx.value
+            # fees would go to a miner upon inclusion; we just burn or hold for now
+            self.metrics.tx_delivered += 1
+            # update EWMA of latency
+            rtt = max(0, self.time_ms - tx.created_ms)
+            alpha = 0.1
+            self.metrics.tx_avg_end_to_end_ms = (1 - alpha) * self.metrics.tx_avg_end_to_end_ms + alpha * rtt
+        else:
+            # forward onward
+            self.schedule_tx_forward(node_id, tx)
 
-    # -------------------------
-    # Mining
-    # -------------------------
-    def mine_step(self):
-        # Per tick Bernoulli for each node
-        H_total = self.total_hashrate()
-        if H_total <= 0:
-            return []
+    # ---------- Blocks (optional, for "blocks in flight") ----------
 
-        finders = []
-        for node in self.nodes.values():
-            share = node.hashrate / H_total
-            # Bernoulli success prob scaled to match target_block_time
-            p = min(0.25, share * (self.dt_ms / self.target_block_time_ms))
-            if self.rng.binomial(1, p) == 1:
-                finders.append(node.id)
-        return finders
+    def mine_tick_and_broadcast(self):
+        H = sum(n.hashrate_hs for n in self.nodes.values())
+        if H <= 0:
+            return
+        for n in self.nodes.values():
+            share = n.hashrate_hs / H
+            p = min(0.25, share * (self.cfg.dt_ms / self.cfg.target_block_time_ms))
+            if self.rand.bernoulli(p):
+                blk = self.create_block(n.node_id)
+                self.broadcast_block(n.node_id, blk)
 
     def create_block(self, miner_id: int) -> Block:
         miner = self.nodes[miner_id]
         parent_id = miner.head_id
-        # Select top-fee txs up to block size that are valid (src has balance)
+        # include up to block_size_txs (naive validity)
         txs = list(miner.mempool.values())
         txs.sort(key=lambda t: t.fee, reverse=True)
-        included = []
-        gas = 0
-        # naive validity check against miner's local balances (not UTXO accurate)
-        local_balances = {i: self.nodes[i].balance for i in self.nodes}
-        for tx in txs:
-            if gas >= self.block_size_txs:
-                break
-            if local_balances.get(tx.src, 0.0) >= tx.amount + tx.fee:
-                local_balances[tx.src] -= (tx.amount + tx.fee)
-                local_balances[tx.dst] = local_balances.get(tx.dst, 0.0) + tx.amount
-                included.append(tx)
-                gas += 1
+        included = txs[: self.cfg.block_size_txs]
+        blk = Block(block_id=next(self.block_seq), miner=miner_id, parent_id=parent_id, timestamp_ms=self.time_ms, txs=included)
+        self.on_block_arrival(miner_id, blk)  # miner accepts immediately
+        return blk
 
-        block = Block(
-            block_id=next(self.block_seq),
-            miner=miner_id,
-            parent_id=parent_id,
-            timestamp_ms=self.time_ms,
-            txs=included
-        )
-        # Miner immediately accepts own block
-        self.on_block_arrival(miner, block)
-        return block
-
-    def apply_block_rewards(self, node: Node, block: Block):
-        # naive economic model:
-        COINBASE = 6.25   # fixed subsidy for demo
-        fees = sum(tx.fee for tx in block.txs)
-        self.nodes[block.miner].balance += (COINBASE + fees)
-
-    # -------------------------
-    # Ticking & stats
-    # -------------------------
-    def tick(self):
-        # 1) Transactions creation at a random node
-        tx = self.maybe_create_random_tx()
-        if tx:
-            # put into creator mempool and broadcast
-            creator = int(tx.src)
-            self.nodes[creator].mempool[tx.tx_id] = tx
-            self.broadcast_tx(creator, tx)
-
-        # 2) Mining
-        winners = self.mine_step()
-        # If multiple miners find blocks in same tick, forks happen
-        for wid in winners:
-            block = self.create_block(wid)
-            self.global_blocks[block.block_id] = block
-            self.broadcast_block(wid, block)
-
-        # 3) Deliver ready events
-        for et, payload in self.q.pop_ready(self.time_ms):
-            if et == "deliver_block":
-                node = self.nodes[payload["to"]]
-                self.on_block_arrival(node, payload["block"])
-            elif et == "deliver_tx":
-                node = self.nodes[payload["to"]]
-                self.on_tx_arrival(node, payload["tx"])
-
-        self.time_ms += self.dt_ms
-
-    def print_stats(self):
-        now_s = self.time_ms / 1000.0
-        if self.time_ms - self._last_stats_print < 5_000:
+    def on_block_arrival(self, node_id: int, blk: Block):
+        node = self.nodes[node_id]
+        if blk.block_id in node.seen_blocks:
             return
-        self._last_stats_print = self.time_ms
+        parent_ok = blk.parent_id in node.blocks
+        node.blocks[blk.block_id] = blk
+        node.seen_blocks.add(blk.block_id)
+        h_parent = node.heights.get(blk.parent_id, -1)
+        node.heights[blk.block_id] = h_parent + 1
+        if node.head_id is None or node.heights[blk.block_id] > node.heights.get(node.head_id, -1):
+            node.head_id = blk.block_id
+            # apply coinbase + fees (simplified)
+            fees = sum(t.fee for t in blk.txs)
+            self.nodes[blk.miner].balance += (self.cfg.coinbase_reward + fees)
+        # prune included txs from mempool
+        for t in blk.txs:
+            node.mempool.pop(t.tx_id, None)
 
-        total_bal = sum(n.balance for n in self.nodes.values())
-        total_hash = self.total_hashrate()
-        inflight_blocks = self.q.count_inflight_blocks()
-        avg_lat = self.q.avg_scheduled_latency_ms()
+    def broadcast_block(self, origin: int, blk: Block):
+        for nb in self.nodes[origin].neighbors:
+            # allow block drop? keep to tx only for now; blocks assumed reliable
+            lat = self.sample_link_latency_ms(origin, nb)
+            self.q.push(self.time_ms + lat, "deliver_block", dict(block=blk, to=nb))
 
-        header = f"\n=== t={now_s:7.2f}s | BlocksInFlight={inflight_blocks} | AvgPropLatency≈{avg_lat:5.1f} ms ==="
-        print(header)
-        print(f"{'Node':>4} | {'Balance':>10} | {'%':>6} | {'Power (H/s)':>12} | {'%':>6} | {'Mempool':>7}")
-        print("-"*64)
-        for i, n in self.nodes.items():
-            bal_pct = (n.balance / total_bal * 100.0) if total_bal > 0 else 0.0
-            pow_pct = (n.hashrate / total_hash * 100.0) if total_hash > 0 else 0.0
-            print(f"{i:4d} | {n.balance:10.3f} | {bal_pct:6.2f} | {n.hashrate:12.2f} | {pow_pct:6.2f} | {len(n.mempool):7d}")
+    # ---------- Ticking ----------
 
-    def run(self):
-        while self.time_ms < self.end_time_ms:
-            self.tick()
-            self.print_stats()
+    def tick(self):
+        # inject new txs
+        self.maybe_inject_tx()
+        # mining (optional)
+        self.mine_tick_and_broadcast()
+        # deliver ready events
+        for ev in self.q.pop_ready(self.time_ms):
+            if ev.kind == "deliver_tx":
+                self.on_tx_arrival(ev.payload["to"], ev.payload["tx"])
+            elif ev.kind == "deliver_block":
+                self.on_block_arrival(ev.payload["to"], ev.payload["block"])
+        self.time_ms += self.cfg.dt_ms
 
-# -----------------------------
-# Demo / Config
-# -----------------------------
+    # ---------- Snapshots ----------
+
+    def snapshot(self) -> NetworkState:
+        return NetworkState(
+            time_ms=self.time_ms,
+            balances={i: n.balance for i, n in self.nodes.items()},
+            hashrates={i: n.hashrate_hs for i, n in self.nodes.items()},
+            latency_means={i: n.latency_mean_ms for i, n in self.nodes.items()},
+            mempool_sizes={i: len(n.mempool) for i, n in self.nodes.items()},
+            inflight_blocks=self.q.count_inflight_blocks(),
+            inflight_txs=self.q.count_inflight_txs(),
+        )
+
+# Gym-like Environment (placeholders only)
+
+class TxRoutingEnv:
+    """A wrapper exposing obs/action/reward hooks for RL LATER.
+    Right now: just defines shapes and accessors; no training logic.
+    """
+    def __init__(self, sim: Sim):
+        self.sim = sim
+        # Define observation / action spaces conceptually
+        self.observation_spec = {
+            "time_ms": "int",
+            "balances": "Dict[node_id->float]",
+            "latency_means": "Dict[node_id->float]",
+            "mempool_sizes": "Dict[node_id->int]",
+            "inflight_blocks": "int",
+            "inflight_txs": "int",
+        }
+        # Action spec: mapping of {tx_id -> next_hop_node_id} per decision epoch
+        self.action_spec = {"route_decisions": "Dict[int->int]"}
+
+    def reset(self):
+        # For later: rebuild Sim with same cfg/seed or new seed
+        return self.sim.snapshot()
+
+    def step(self, action: Optional[Dict[int, int]] = None):
+        """For later: apply external routing decisions. Not used now."""
+        # Placeholder: ignore actions now
+        self.sim.tick()
+        obs = self.sim.snapshot()
+        reward = None  # <- DO NOT define yet
+        done = self.sim.time_ms >= self.sim.cfg.sim_time_ms
+        info = {}
+        return obs, reward, done, info
+
+def demo_run():
+    cfg = SimConfig()
+    sim = Sim(cfg)
+    env = TxRoutingEnv(sim)
+    obs = env.reset()
+    # run without decisions (placeholder router handles forwarding)
+    while sim.time_ms < cfg.sim_time_ms:
+        obs, reward, done, info = env.step(action=None)
+        if sim.time_ms % 5000 == 0:  # print every ~5s
+            snap = sim.snapshot()
+            print(
+                f"t={snap.time_ms/1000:6.1f}s | Inflight blocks={snap.inflight_blocks} | "
+                f"Inflight txs={snap.inflight_txs} | avg e2e={sim.metrics.tx_avg_end_to_end_ms:.1f} ms"
+            )
+        if done:
+            break
+
 if __name__ == "__main__":
-    CONFIG = dict(
-        n_nodes=6,
-        target_block_time_ms=25_000,   # average ~25s per block across the network
-        dt_ms=100,                     # 100ms per tick
-        sim_time_ms=120_000,           # run 2 minutes
-        tx_bernoulli_p=0.15,           # 15% chance to create one tx per tick
-        tx_amount_mean=1.0,
-        tx_fee_mean=0.02,
-        block_size_txs=800,
-        seed=1337
-    )
-    sim = NetworkSim(**CONFIG)
-    sim.run()
+    demo_run()
